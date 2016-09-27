@@ -1,36 +1,3 @@
-# Copyright 2015 The TensorFlow Authors. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-
-"""Builds the CIFAR-10 network.
-
-Summary of available functions:
-
- # Compute input images and labels for training. If you would like to run
- # evaluations, use inputs() instead.
- inputs, labels = distorted_inputs()
-
- # Compute inference on the model inputs to make a prediction.
- predictions = inference(inputs)
-
- # Compute the total loss of the prediction with respect to the labels.
- loss = loss(predictions, labels)
-
- # Create a graph to run one step of training with respect to the loss.
- train_op = train(loss, global_step)
-"""
-# pylint: disable=missing-docstring
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -41,35 +8,33 @@ import re
 import sys
 import tarfile
 
+import tensorflow.python.platform
 from six.moves import urllib
+from six.moves import xrange  # pylint: disable=redefined-builtin
 import tensorflow as tf
 
-from tensorflow.models.image.cifar10 import cifar10_input
+import svhn_input
+from tensorflow.python.platform import gfile
+import svhn_flags
 
 FLAGS = tf.app.flags.FLAGS
 
-# Basic model parameters.
-tf.app.flags.DEFINE_integer('batch_size', 128,
-                            """Number of images to process in a batch.""")
-tf.app.flags.DEFINE_string('data_dir', '/tmp/cifar10_data',
-                           """Path to the CIFAR-10 data directory.""")
-tf.app.flags.DEFINE_boolean('use_fp16', False,
-                            """Train the model using fp16.""")
+# Process images of this size. Note that this differs from the original CIFAR
+# image size of 32 x 32. If one alters this number, then the entire model
+# architecture will change and any model would need to be retrained.
+IMAGE_SIZE = FLAGS.image_size
 
 # Global constants describing the CIFAR-10 data set.
-IMAGE_SIZE = cifar10_input.IMAGE_SIZE
-NUM_CLASSES = cifar10_input.NUM_CLASSES
-NUM_EXAMPLES_PER_EPOCH_FOR_TRAIN = cifar10_input.NUM_EXAMPLES_PER_EPOCH_FOR_TRAIN
-NUM_EXAMPLES_PER_EPOCH_FOR_EVAL = cifar10_input.NUM_EXAMPLES_PER_EPOCH_FOR_EVAL
-
+NUM_CLASSES = FLAGS.num_classes
+NUM_EXAMPLES_PER_EPOCH_FOR_TRAIN = FLAGS.num_examples_per_epoch_for_train
 
 # Constants describing the training process.
-MOVING_AVERAGE_DECAY = 0.9999     # The decay to use for the moving average.
-NUM_EPOCHS_PER_DECAY = 350.0      # Epochs after which learning rate decays.
-LEARNING_RATE_DECAY_FACTOR = 0.1  # Learning rate decay factor.
-INITIAL_LEARNING_RATE = 0.1       # Initial learning rate.
+MOVING_AVERAGE_DECAY = FLAGS.moving_average_decay   # The decay to use for the moving average.
+NUM_EPOCHS_PER_DECAY = FLAGS.num_epochs_per_decay      # Epochs after which learning rate decays.
+LEARNING_RATE_DECAY_FACTOR = FLAGS.learning_rate_decay_factor  # Learning rate decay factor.
+INITIAL_LEARNING_RATE = FLAGS.learning_rate     # Initial learning rate.
 
-# If a model is trained with multiple GPUs, prefix all Op names with tower_name
+# If a model is trained with multiple GPU's prefix all Op names with tower_name
 # to differentiate the operations. Note that this prefix is removed from the
 # names of the summaries when visualizing a model.
 TOWER_NAME = 'tower'
@@ -107,8 +72,7 @@ def _variable_on_cpu(name, shape, initializer):
     Variable Tensor
   """
   with tf.device('/cpu:0'):
-    dtype = tf.float16 if FLAGS.use_fp16 else tf.float32
-    var = tf.get_variable(name, shape, initializer=initializer, dtype=dtype)
+    var = tf.get_variable(name, shape, initializer=initializer)
   return var
 
 
@@ -128,61 +92,88 @@ def _variable_with_weight_decay(name, shape, stddev, wd):
   Returns:
     Variable Tensor
   """
-  dtype = tf.float16 if FLAGS.use_fp16 else tf.float32
-  var = _variable_on_cpu(
-      name,
-      shape,
-      tf.truncated_normal_initializer(stddev=stddev, dtype=dtype))
-  if wd is not None:
+  var = _variable_on_cpu(name, shape,
+                         tf.truncated_normal_initializer(stddev=stddev))
+  if wd:
     weight_decay = tf.mul(tf.nn.l2_loss(var), wd, name='weight_loss')
     tf.add_to_collection('losses', weight_decay)
   return var
 
 
+def _generate_image_and_label_batch(image, label, min_queue_examples):
+  """Construct a queued batch of images and labels.
+
+  Args:
+    image: 3-D Tensor of [IMAGE_SIZE, IMAGE_SIZE, 3] of type.float32.
+    label: 1-D Tensor of type.int32
+    min_queue_examples: int32, minimum number of samples to retain
+      in the queue that provides of batches of examples.
+
+  Returns:
+    images: Images. 4D tensor of [batch_size, IMAGE_SIZE, IMAGE_SIZE, 3] size.
+    labels: Labels. 1D tensor of [batch_size] size.
+  """
+  # Create a queue that shuffles the examples, and then
+  # read 'FLAGS.batch_size' images + labels from the example queue.
+  num_preprocess_threads = 16
+  images, label_batch = tf.train.shuffle_batch(
+      [image, label],
+      batch_size=FLAGS.batch_size,
+      num_threads=num_preprocess_threads,
+      capacity=min_queue_examples + 3 * FLAGS.batch_size,
+      min_after_dequeue=min_queue_examples)
+
+  # Display the training images in the visualizer.
+  tf.image_summary('images', images, max_images = 29)
+
+  return images, tf.reshape(label_batch, [FLAGS.batch_size])
+
+
 def distorted_inputs():
   """Construct distorted input for CIFAR training using the Reader ops.
 
-  Returns:
-    images: Images. 4D tensor of [batch_size, IMAGE_SIZE, IMAGE_SIZE, 3] size.
-    labels: Labels. 1D tensor of [batch_size] size.
-
   Raises:
-    ValueError: If no data_dir
-  """
-  if not FLAGS.data_dir:
-    raise ValueError('Please supply a data_dir')
-  data_dir = os.path.join(FLAGS.data_dir, 'cifar-10-batches-bin')
-  images, labels = cifar10_input.distorted_inputs(data_dir=data_dir,
-                                                  batch_size=FLAGS.batch_size)
-  if FLAGS.use_fp16:
-    images = tf.cast(images, tf.float16)
-    labels = tf.cast(labels, tf.float16)
-  return images, labels
-
-
-def inputs(eval_data):
-  """Construct input for CIFAR evaluation using the Reader ops.
-
-  Args:
-    eval_data: bool, indicating if one should use the train or eval data set.
+    ValueError: if no data_dir
 
   Returns:
     images: Images. 4D tensor of [batch_size, IMAGE_SIZE, IMAGE_SIZE, 3] size.
     labels: Labels. 1D tensor of [batch_size] size.
-
-  Raises:
-    ValueError: If no data_dir
   """
-  if not FLAGS.data_dir:
-    raise ValueError('Please supply a data_dir')
-  data_dir = os.path.join(FLAGS.data_dir, 'cifar-10-batches-bin')
-  images, labels = cifar10_input.inputs(eval_data=eval_data,
-                                        data_dir=data_dir,
-                                        batch_size=FLAGS.batch_size)
-  if FLAGS.use_fp16:
-    images = tf.cast(images, tf.float16)
-    labels = tf.cast(labels, tf.float16)
-  return images, labels
+  # filenames = [os.path.join(FLAGS.data_dir, 'data_batch_%d.bin' % i) for i in xrange(1, 7)]
+  filenames = [os.path.join(FLAGS.data_dir,'train_batch.bin')]
+  for f in filenames:
+    if not gfile.Exists(f):
+      raise ValueError('Failed to find file: ' + f)
+
+  # Create a queue that produces the filenames to read.
+  filename_queue = tf.train.string_input_producer(filenames)
+
+  # Read examples from files in the filename queue.
+  read_input = svhn_input.read_cifar10(filename_queue)
+  reshaped_image = tf.cast(read_input.uint8image, tf.float32)
+  distorted_image = tf.image.random_brightness(reshaped_image,
+                                               max_delta=63)
+  distorted_image = tf.image.random_contrast(distorted_image,
+                                             lower=0.2, upper=1.8)
+
+  # Subtract off the mean and divide by the variance of the pixels.
+  float_image = tf.image.per_image_whitening(distorted_image)
+
+  # Ensure that the random shuffling has good mixing properties.
+  min_fraction_of_examples_in_queue = 0.4
+  min_queue_examples = int(NUM_EXAMPLES_PER_EPOCH_FOR_TRAIN *
+                           min_fraction_of_examples_in_queue)
+  print ('Filling queue with %d SVHN images before starting to train. '
+         'This will take a few minutes.' % min_queue_examples)
+
+  # Generate a batch of images and labels by building up a queue of examples.
+  return _generate_image_and_label_batch(float_image, read_input.label,
+                                         min_queue_examples)
+
+
+# This function is only called by svhn_eval
+# No shuffling, because you want to see the corresponding results.
+
 
 
 def inference(images):
@@ -201,10 +192,8 @@ def inference(images):
   #
   # conv1
   with tf.variable_scope('conv1') as scope:
-    kernel = _variable_with_weight_decay('weights',
-                                         shape=[5, 5, 3, 64],
-                                         stddev=5e-2,
-                                         wd=0.0)
+    kernel = _variable_with_weight_decay('weights', shape=[5, 5, FLAGS.num_channels, 64],
+                                         stddev=1e-4, wd=0.0)
     conv = tf.nn.conv2d(images, kernel, [1, 1, 1, 1], padding='SAME')
     biases = _variable_on_cpu('biases', [64], tf.constant_initializer(0.0))
     bias = tf.nn.bias_add(conv, biases)
@@ -220,10 +209,8 @@ def inference(images):
 
   # conv2
   with tf.variable_scope('conv2') as scope:
-    kernel = _variable_with_weight_decay('weights',
-                                         shape=[5, 5, 64, 64],
-                                         stddev=5e-2,
-                                         wd=0.0)
+    kernel = _variable_with_weight_decay('weights', shape=[5, 5, 64, 64],
+                                         stddev=1e-4, wd=0.0)
     conv = tf.nn.conv2d(norm1, kernel, [1, 1, 1, 1], padding='SAME')
     biases = _variable_on_cpu('biases', [64], tf.constant_initializer(0.1))
     bias = tf.nn.bias_add(conv, biases)
@@ -240,12 +227,15 @@ def inference(images):
   # local3
   with tf.variable_scope('local3') as scope:
     # Move everything into depth so we can perform a single matrix multiply.
-    reshape = tf.reshape(pool2, [FLAGS.batch_size, -1])
-    dim = reshape.get_shape()[1].value
+    dim = 1
+    for d in pool2.get_shape()[1:].as_list():
+      dim *= d
+    reshape = tf.reshape(pool2, [FLAGS.batch_size, dim])
+
     weights = _variable_with_weight_decay('weights', shape=[dim, 384],
                                           stddev=0.04, wd=0.004)
     biases = _variable_on_cpu('biases', [384], tf.constant_initializer(0.1))
-    local3 = tf.nn.relu(tf.matmul(reshape, weights) + biases, name=scope.name)
+    local3 = tf.nn.relu_layer(reshape, weights, biases, name=scope.name)
     _activation_summary(local3)
 
   # local4
@@ -253,7 +243,7 @@ def inference(images):
     weights = _variable_with_weight_decay('weights', shape=[384, 192],
                                           stddev=0.04, wd=0.004)
     biases = _variable_on_cpu('biases', [192], tf.constant_initializer(0.1))
-    local4 = tf.nn.relu(tf.matmul(local3, weights) + biases, name=scope.name)
+    local4 = tf.nn.relu_layer(local3, weights, biases, name=scope.name)
     _activation_summary(local4)
 
   # softmax, i.e. softmax(WX + b)
@@ -262,7 +252,7 @@ def inference(images):
                                           stddev=1/192.0, wd=0.0)
     biases = _variable_on_cpu('biases', [NUM_CLASSES],
                               tf.constant_initializer(0.0))
-    softmax_linear = tf.add(tf.matmul(local4, weights), biases, name=scope.name)
+    softmax_linear = tf.nn.xw_plus_b(local4, weights, biases, name=scope.name)
     _activation_summary(softmax_linear)
 
   return softmax_linear
@@ -271,7 +261,7 @@ def inference(images):
 def loss(logits, labels):
   """Add L2Loss to all the trainable variables.
 
-  Add summary for "Loss" and "Loss/avg".
+  Add summary for for "Loss" and "Loss/avg".
   Args:
     logits: Logits from inference().
     labels: Labels from distorted_inputs or inputs(). 1-D tensor
@@ -280,10 +270,19 @@ def loss(logits, labels):
   Returns:
     Loss tensor of type float.
   """
+  # Reshape the labels into a dense Tensor of
+  # shape [batch_size, NUM_CLASSES].
+  sparse_labels = tf.reshape(labels, [FLAGS.batch_size, 1])
+  ### ORIGINAL ###
+  indices = tf.reshape(tf.range(FLAGS.batch_size), [FLAGS.batch_size, 1])
+  ###############
+  # indices = tf.expand_dims(tf.range(0, FLAGS.batch_size, 1), 1)
+  concated = tf.concat(1, [indices, sparse_labels])
+  dense_labels = tf.sparse_to_dense(concated,[FLAGS.batch_size, NUM_CLASSES],1.0, 0.0)
+
   # Calculate the average cross entropy loss across the batch.
-  labels = tf.cast(labels, tf.int64)
-  cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
-      logits, labels, name='cross_entropy_per_example')
+  cross_entropy = tf.nn.softmax_cross_entropy_with_logits(
+      logits, dense_labels, name='cross_entropy_per_example')
   cross_entropy_mean = tf.reduce_mean(cross_entropy, name='cross_entropy')
   tf.add_to_collection('losses', cross_entropy_mean)
 
@@ -308,7 +307,7 @@ def _add_loss_summaries(total_loss):
   losses = tf.get_collection('losses')
   loss_averages_op = loss_averages.apply(losses + [total_loss])
 
-  # Attach a scalar summary to all individual losses and the total loss; do the
+  # Attach a scalar summmary to all individual losses and the total loss; do the
   # same for the averaged version of the losses.
   for l in losses + [total_loss]:
     # Name each loss as '(raw)' and name the moving average version of the loss
@@ -361,7 +360,7 @@ def train(total_loss, global_step):
 
   # Add histograms for gradients.
   for grad, var in grads:
-    if grad is not None:
+    if grad:
       tf.histogram_summary(var.op.name + '/gradients', grad)
 
   # Track the moving averages of all trainable variables.
@@ -373,22 +372,3 @@ def train(total_loss, global_step):
     train_op = tf.no_op(name='train')
 
   return train_op
-
-
-def maybe_download_and_extract():
-  """Download and extract the tarball from Alex's website."""
-  dest_directory = FLAGS.data_dir
-  if not os.path.exists(dest_directory):
-    os.makedirs(dest_directory)
-  filename = DATA_URL.split('/')[-1]
-  filepath = os.path.join(dest_directory, filename)
-  if not os.path.exists(filepath):
-    def _progress(count, block_size, total_size):
-      sys.stdout.write('\r>> Downloading %s %.1f%%' % (filename,
-          float(count * block_size) / float(total_size) * 100.0))
-      sys.stdout.flush()
-    filepath, _ = urllib.request.urlretrieve(DATA_URL, filepath, _progress)
-    print()
-    statinfo = os.stat(filepath)
-    print('Successfully downloaded', filename, statinfo.st_size, 'bytes.')
-    tarfile.open(filepath, 'r:gz').extractall(dest_directory)
